@@ -65,7 +65,6 @@ jobs:
     steps:
       - id: plan
         env:
-          EVENT_NAME: ${{ github.event_name }}
           CALL_RELEASES_JSON: ${{ inputs.releases_json }}
           CALL_MATRIX_JSON: ${{ inputs.matrix_json }}
           INPUT_VERSION: ${{ inputs.rocksdb_version }}
@@ -91,10 +90,11 @@ jobs:
           TWO_PART_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
           UPSTREAM_TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+(?:\.[0-9]+)?$")
 
-          event_name = os.environ["EVENT_NAME"]
-          if event_name == "workflow_call":
-              releases = json.loads(os.environ["CALL_RELEASES_JSON"])
-              matrix = json.loads(os.environ["CALL_MATRIX_JSON"])
+          call_releases_raw = os.environ.get("CALL_RELEASES_JSON", "").strip()
+          call_matrix_raw = os.environ.get("CALL_MATRIX_JSON", "").strip()
+          if call_releases_raw or call_matrix_raw:
+              releases = json.loads(call_releases_raw)
+              matrix = json.loads(call_matrix_raw)
 
               if not isinstance(releases, list) or not releases:
                   print("ERROR: releases_json must be a non-empty JSON array", file=sys.stderr)
