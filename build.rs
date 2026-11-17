@@ -372,13 +372,13 @@ fn build_cxx_flags(
         }
     }
 
-    let features: Vec<&str> = features_raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-
     if target_arch == "x86_64" {
+        let features: Vec<&str> = features_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+
         if target_env == "msvc" {
             if features.contains(&"avx2") {
                 flags.push("/arch:AVX2".to_owned());
@@ -408,10 +408,13 @@ fn build_cxx_flags(
         }
     } else if target_arch == "aarch64"
         && target_env != "msvc"
-        && features.contains(&"crc")
-        && features.contains(&"aes")
+        && !matches!(target_os, "macos" | "ios")
     {
-        flags.push("-march=armv8-a+crc+aes+crypto".to_owned());
+        // Enable ARMv8 CRC32 and Crypto (PMULL) intrinsics for util/crc32c_arm64.cc,
+        // which guards both behind runtime AT_HWCAP / sysctl checks. Skip on Apple
+        // targets where Clang already defaults to apple-m1 (ARMv8.5-A + LSE + CRC + Crypto)
+        // and passing -march=armv8-a... would downgrade LSE hardware atomics.
+        flags.push("-march=armv8-a+crc+crypto".to_owned());
     }
 
     flags
