@@ -379,31 +379,27 @@ fn build_cxx_flags(
             .filter(|s| !s.is_empty())
             .collect();
 
+        // Default to upstream RocksDB's recommended portable x86_64 baseline
+        // (`PORTABLE=haswell` / `/arch:AVX2`: SSE4.2 + PCLMUL + POPCNT + AVX2 +
+        // BMI1/BMI2 + LZCNT), while still forwarding explicit AVX-512 target
+        // features. End-user `CXXFLAGS` are appended later by `cc::Build` and
+        // can still override `-march=` / `/arch:`.
         if target_env == "msvc" {
-            if features.contains(&"avx2") {
+            if features.contains(&"avx512f") {
+                flags.push("/arch:AVX512".to_owned());
+            } else {
                 flags.push("/arch:AVX2".to_owned());
-            } else if features.contains(&"avx") {
-                flags.push("/arch:AVX".to_owned());
             }
         } else {
+            flags.push("-march=haswell".to_owned());
             for (feat, flag) in [
-                ("sse2", "-msse2"),
-                ("sse4.1", "-msse4.1"),
-                ("sse4.2", "-msse4.2"),
-                ("avx", "-mavx"),
-                ("avx2", "-mavx2"),
-                ("bmi1", "-mbmi"),
-                ("lzcnt", "-mlzcnt"),
-                ("pclmulqdq", "-mpclmul"),
+                ("avx512f", "-mavx512f"),
+                ("avx512vl", "-mavx512vl"),
+                ("avx512bw", "-mavx512bw"),
             ] {
                 if features.contains(&feat) {
                     flags.push(flag.to_owned());
                 }
-            }
-            if (features.contains(&"avx") || features.contains(&"avx2"))
-                && !features.contains(&"pclmulqdq")
-            {
-                flags.push("-mpclmul".to_owned());
             }
         }
     } else if target_arch == "aarch64"
