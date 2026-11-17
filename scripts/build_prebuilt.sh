@@ -126,7 +126,6 @@ verify_rocksdb_tree() {
     for rel in \
         "src.mk" \
         "util/build_version.cc.in" \
-        "table/two_level_iterator.cc" \
         "include/rocksdb/version.h" \
         "port/stack_trace.h" \
         "LICENSE.Apache" \

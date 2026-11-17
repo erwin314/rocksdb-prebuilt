@@ -30,10 +30,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let include_dir = rocksdb_dir.join("include");
     let src_mk = rocksdb_dir.join("src.mk");
     let build_version_in = rocksdb_dir.join("util/build_version.cc.in");
-    let two_level_iter_cc = rocksdb_dir.join("table/two_level_iterator.cc");
     let version_h = include_dir.join("rocksdb/version.h");
 
-    for tracked in [&src_mk, &build_version_in, &two_level_iter_cc, &version_h] {
+    for tracked in [&src_mk, &build_version_in, &version_h] {
         emit(&format!("cargo::rerun-if-changed={}", tracked.display()))?;
     }
 
@@ -71,8 +70,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let lib_sources = parse_lib_sources(&src_mk, &target_os)?;
     let build_version_cc = generate_build_version(&build_version_in, &out_dir, &version)?;
-    let patched_two_level_iter_cc =
-        generate_patched_two_level_iterator(&two_level_iter_cc, &out_dir)?;
 
     let mut build = cc::Build::new();
     build
@@ -111,7 +108,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         build.file(rocksdb_dir.join(rel));
     }
     build.file(build_version_cc);
-    build.file(patched_two_level_iter_cc);
 
     build.compile("rocksdb");
 
@@ -164,7 +160,6 @@ fn validated_source_dir(expected_version: &str) -> Result<PathBuf, Box<dyn Error
     for rel in [
         "src.mk",
         "util/build_version.cc.in",
-        "table/two_level_iterator.cc",
         "include/rocksdb/version.h",
         "port/stack_trace.h",
     ] {
@@ -462,10 +457,7 @@ fn push_source_tokens(line: &str, sources: &mut Vec<String>, target_os: &str) ->
         if token.starts_with('#') {
             break;
         }
-        if matches!(
-            token,
-            "db/c.cc" | "util/build_version.cc" | "table/two_level_iterator.cc"
-        ) {
+        if matches!(token, "db/c.cc" | "util/build_version.cc") {
             continue;
         }
         if target_os != "windows" && token.starts_with("port/win/") {
@@ -502,35 +494,6 @@ fn generate_build_version(
         .replace("@ROCKSDB_PLUGIN_BUILTINS@", "");
 
     let dest = out_dir.join("build_version.cc");
-    write_if_changed(&dest, &rendered)?;
-    Ok(dest)
-}
-
-/// Upstream RocksDB `TwoLevelIndexIterator` omits `status_.PermitUncheckedError()` in its
-/// destructor, causing `-DROCKSDB_ASSERT_STATUS_CHECKED` to abort on early table-get exits.
-fn generate_patched_two_level_iterator(
-    src_path: &Path,
-    out_dir: &Path,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let source = fs::read_to_string(src_path)?;
-    let needle = "~TwoLevelIndexIterator() override {";
-    let rendered = if source.contains("status_.PermitUncheckedError()") {
-        source
-    } else if source.contains(needle) {
-        source.replacen(
-            needle,
-            "~TwoLevelIndexIterator() override {\n    status_.PermitUncheckedError();",
-            1,
-        )
-    } else {
-        return Err(format!(
-            "Failed to patch TwoLevelIndexIterator destructor in {}: expected `{needle}` or `status_.PermitUncheckedError()`",
-            src_path.display()
-        )
-        .into());
-    };
-
-    let dest = out_dir.join("two_level_iterator.cc");
     write_if_changed(&dest, &rendered)?;
     Ok(dest)
 }
