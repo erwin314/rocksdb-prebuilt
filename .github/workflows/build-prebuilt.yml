@@ -1,0 +1,227 @@
+name: Build Prebuilt RocksDB
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocksdb_version:
+        description: Upstream RocksDB version (e.g. 11.8.1 or 11.13.2)
+        type: string
+        required: true
+      publish_release:
+        description: Create or update GitHub Release v<version> with built tarballs
+        type: boolean
+        required: true
+        default: true
+      include_linux_x64:
+        description: Build Linux x86_64 (x86_64-unknown-linux-gnu)
+        type: boolean
+        required: true
+        default: true
+      include_linux_arm64:
+        description: Build Linux ARM64 (aarch64-unknown-linux-gnu)
+        type: boolean
+        required: true
+        default: false
+      include_macos_arm64:
+        description: Build macOS Apple Silicon (aarch64-apple-darwin)
+        type: boolean
+        required: true
+        default: false
+      include_windows_x64:
+        description: Build Windows x86_64 MSVC (x86_64-pc-windows-msvc)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.100.0"
+
+jobs:
+  plan-matrix:
+    name: Validate Version & Plan Matrix
+    runs-on: ubuntu-26.04
+    outputs:
+      rocksdb_version: ${{ steps.plan.outputs.rocksdb_version }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          INPUT_VERSION: ${{ inputs.rocksdb_version }}
+          INCLUDE_LINUX_X64: ${{ inputs.include_linux_x64 }}
+          INCLUDE_LINUX_ARM64: ${{ inputs.include_linux_arm64 }}
+          INCLUDE_MACOS_ARM64: ${{ inputs.include_macos_arm64 }}
+          INCLUDE_WINDOWS_X64: ${{ inputs.include_windows_x64 }}
+        run: |
+          VERSION="${INPUT_VERSION#v}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: rocksdb_version must be MAJOR.MINOR.PATCH (got '${INPUT_VERSION}')" >&2
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --tags https://github.com/facebook/rocksdb.git "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "ERROR: upstream tag v${VERSION} was not found in https://github.com/facebook/rocksdb.git" >&2
+            exit 1
+          fi
+
+          MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          entries = []
+          if os.environ.get("INCLUDE_LINUX_X64") == "true":
+              entries.append({"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-24.04"})
+          if os.environ.get("INCLUDE_LINUX_ARM64") == "true":
+              entries.append({"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-24.04-arm"})
+          if os.environ.get("INCLUDE_MACOS_ARM64") == "true":
+              entries.append({"target": "aarch64-apple-darwin", "os": "macos-15"})
+          if os.environ.get("INCLUDE_WINDOWS_X64") == "true":
+              entries.append({"target": "x86_64-pc-windows-msvc", "os": "windows-2025"})
+
+          if not entries:
+              print("ERROR: select at least one target platform to build", file=sys.stderr)
+              sys.exit(1)
+
+          print(json.dumps(entries, separators=(",", ":")))
+          PY
+          )"
+
+          RELEASE_TAG="v${VERSION}"
+          echo "RocksDB version: ${VERSION} (release tag: ${RELEASE_TAG})"
+          echo "Planned matrix: ${MATRIX}"
+          {
+            echo "rocksdb_version=${VERSION}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "matrix=${MATRIX}"
+          } >> "${GITHUB_OUTPUT}"
+
+  prepare-release:
+    name: Ensure GitHub Release
+    needs: plan-matrix
+    if: inputs.publish_release
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create Release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan-matrix.outputs.release_tag }}
+        run: |
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --target "${{ github.sha }}" \
+              --title "RocksDB ${RELEASE_TAG}" \
+              --notes "Prebuilt static C++20 librocksdb.a archives for upstream RocksDB ${RELEASE_TAG} (ndebug and checked-status variants)."
+          fi
+
+  build:
+    name: Build (${{ matrix.target }} on ${{ matrix.os }})
+    needs: [plan-matrix, prepare-release]
+    if: always() && needs.plan-matrix.result == 'success' && (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache upstream RocksDB source
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/rocksdb-prebuilt/src
+          key: rocksdb-src-${{ needs.plan-matrix.outputs.release_tag }}
+
+      - name: Build prebuilt RocksDB tarballs
+        env:
+          ROCKSDB_VERSION: ${{ needs.plan-matrix.outputs.rocksdb_version }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
+            export MACOSX_DEPLOYMENT_TARGET="13.0"
+          fi
+          ./scripts/build_prebuilt.sh \
+            --version "${ROCKSDB_VERSION}" \
+            --target "${MATRIX_TARGET}" \
+            --out-dir "${RUNNER_TEMP}/prebuilt-dist"
+
+      - name: Verify prebuilt tarball layout and metadata
+        env:
+          ROCKSDB_VERSION: ${{ needs.plan-matrix.outputs.rocksdb_version }}
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: |
+          DIST_DIR="${RUNNER_TEMP}/prebuilt-dist"
+          WORK_VERIFY="${RUNNER_TEMP}/verify"
+          if command -v cygpath >/dev/null 2>&1; then
+            DIST_DIR="$(cygpath -u "${DIST_DIR}")"
+            WORK_VERIFY="$(cygpath -u "${WORK_VERIFY}")"
+          fi
+          EXPECTED_NS="rocksdb_v${ROCKSDB_VERSION//./_}"
+
+          {
+            echo "### Prebuilt RocksDB Archives (${MATRIX_TARGET})"
+            echo ""
+            echo "| Variant | Archive | Size (bytes) |"
+            echo "| :--- | :--- | ---: |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          for variant in ndebug checked-status; do
+            ARCHIVE="rocksdb-v${ROCKSDB_VERSION}-${MATRIX_TARGET}-${variant}.tar.gz"
+            ARCHIVE_PATH="${DIST_DIR}/${ARCHIVE}"
+            [[ -s "${ARCHIVE_PATH}" ]]
+
+            EXTRACT_DIR="${WORK_VERIFY}/${variant}"
+            rm -rf -- "${EXTRACT_DIR}"
+            mkdir -p "${EXTRACT_DIR}"
+            tar -xzf "${ARCHIVE_PATH}" -C "${EXTRACT_DIR}"
+
+            [[ -s "${EXTRACT_DIR}/lib/librocksdb.a" ]]
+            [[ -f "${EXTRACT_DIR}/include/rocksdb/version.h" ]]
+            [[ -f "${EXTRACT_DIR}/port/stack_trace.h" ]]
+            [[ -f "${EXTRACT_DIR}/LICENSE.Apache" ]]
+            [[ -f "${EXTRACT_DIR}/COPYING" ]]
+            grep -qx "rocksdb_version=${ROCKSDB_VERSION}" "${EXTRACT_DIR}/build-info.env"
+            grep -qx "namespace=${EXPECTED_NS}" "${EXTRACT_DIR}/build-info.env"
+            grep -qx "target=${MATRIX_TARGET}" "${EXTRACT_DIR}/build-info.env"
+            grep -qx "status_abi=${variant}" "${EXTRACT_DIR}/build-info.env"
+            grep -qE '^cxx_defines=.+' "${EXTRACT_DIR}/build-info.env"
+
+            SIZE_BYTES="$(wc -c < "${ARCHIVE_PATH}" | tr -d ' ')"
+            echo "| \`${variant}\` | \`${ARCHIVE}\` | ${SIZE_BYTES} |" >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: ${{ runner.temp }}/prebuilt-dist/*.tar.gz
+
+      - name: Upload tarballs to GitHub Release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan-matrix.outputs.release_tag }}
+        run: |
+          DIST_DIR="${RUNNER_TEMP}/prebuilt-dist"
+          if command -v cygpath >/dev/null 2>&1; then
+            DIST_DIR="$(cygpath -u "${DIST_DIR}")"
+          fi
+          gh release upload "${RELEASE_TAG}" "${DIST_DIR}"/*.tar.gz --clobber
