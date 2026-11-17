@@ -5,7 +5,7 @@ set -euo pipefail
 # `checked-status` ABI variants.
 #
 # Usage:
-#   ./scripts/build_prebuilt.sh --version <X.Y.Z> [--target <TRIPLE>] [--out-dir <DIR>]
+#   ./scripts/build_prebuilt.sh --version <X.Y.Z|X.Y> [--upstream-tag <TAG>] [--target <TRIPLE>] [--out-dir <DIR>] [--fetch-only]
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -30,19 +30,23 @@ to_native_path() {
 
 usage() {
     cat <<'EOF'
-Usage: build_prebuilt.sh --version <X.Y.Z> [--target <TRIPLE>] [--out-dir <DIR>]
+Usage: build_prebuilt.sh --version <X.Y.Z|X.Y> [--upstream-tag <TAG>] [--target <TRIPLE>] [--out-dir <DIR>] [--fetch-only]
 
 Options:
-  --version <X.Y.Z>   Upstream RocksDB version to build (e.g. 11.8.1 or v11.8.1)
-  --target <TRIPLE>   Rust target triple (defaults to host target from rustc -vV)
-  --out-dir <DIR>     Output directory for .tar.gz archives (defaults to ./dist)
-  -h, --help          Show this help message
+  --version <X.Y.Z|X.Y>  Upstream RocksDB version to build (e.g. 11.8.1, 11.12, or 11.13.2)
+  --upstream-tag <TAG>   Explicit upstream git tag (defaults to v<version>, falling back to v<major>.<minor>)
+  --target <TRIPLE>      Rust target triple (defaults to host target from rustc -vV)
+  --out-dir <DIR>        Output directory for .tar.gz archives (defaults to ./dist)
+  --fetch-only           Fetch/validate RocksDB source tree and print its path without compiling
+  -h, --help             Show this help message
 EOF
 }
 
 VERSION=""
+UPSTREAM_TAG=""
 TARGET=""
 OUT_DIR="${REPO_DIR}/dist"
+FETCH_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,6 +57,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --version=*)
             VERSION="${1#*=}"
+            shift
+            ;;
+        --upstream-tag)
+            [[ $# -ge 2 ]] || { echo "ERROR: --upstream-tag requires an argument" >&2; exit 2; }
+            UPSTREAM_TAG="$2"
+            shift 2
+            ;;
+        --upstream-tag=*)
+            UPSTREAM_TAG="${1#*=}"
             shift
             ;;
         --target)
@@ -73,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             OUT_DIR="${1#*=}"
             shift
             ;;
+        --fetch-only)
+            FETCH_ONLY=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -86,18 +103,31 @@ while [[ $# -gt 0 ]]; do
 done
 
 VERSION="${VERSION#v}"
+if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    VERSION="${VERSION}.0"
+fi
 if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "ERROR: --version <X.Y.Z> is required (got '${VERSION}')" >&2
+    echo "ERROR: --version <X.Y.Z|X.Y> is required (got '${VERSION}')" >&2
     usage >&2
     exit 2
 fi
 
-if [[ -z "${TARGET}" ]]; then
-    TARGET="$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')"
+if [[ -n "${UPSTREAM_TAG}" ]]; then
+    UPSTREAM_TAG="v${UPSTREAM_TAG#v}"
+    if [[ ! "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: --upstream-tag must match vX.Y or vX.Y.Z (got '${UPSTREAM_TAG}')" >&2
+        exit 2
+    fi
 fi
-if [[ -z "${TARGET}" ]]; then
-    echo "ERROR: failed to determine target triple; pass --target <TRIPLE>" >&2
-    exit 1
+
+if [[ "${FETCH_ONLY}" -eq 0 ]]; then
+    if [[ -z "${TARGET}" ]]; then
+        TARGET="$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')"
+    fi
+    if [[ -z "${TARGET}" ]]; then
+        echo "ERROR: failed to determine target triple; pass --target <TRIPLE>" >&2
+        exit 1
+    fi
 fi
 
 OUT_DIR="$(to_unix_path "${OUT_DIR}")"
@@ -139,6 +169,7 @@ verify_rocksdb_tree() {
 
 ensure_rocksdb_source() {
     local version="$1"
+    local upstream_tag="${2:-}"
     if [[ -n "${ROCKSDB_SOURCE_DIR:-}" ]]; then
         local explicit
         explicit="$(to_unix_path "${ROCKSDB_SOURCE_DIR}")"
@@ -172,24 +203,49 @@ ensure_rocksdb_source() {
     local fetch_tmp
     fetch_tmp="$(mktemp -d "${cache_base}/src/.fetch-v${version}.XXXXXX")"
 
-    local tarball_url="https://github.com/facebook/rocksdb/archive/refs/tags/v${version}.tar.gz"
-    local staged_tree=""
-    echo "==> Fetching upstream RocksDB v${version}..." >&2
-    if curl -fsSL --retry 3 --retry-delay 2 "${tarball_url}" -o "${fetch_tmp}/rocksdb.tar.gz" \
-        && tar -xzf "${fetch_tmp}/rocksdb.tar.gz" -C "${fetch_tmp}" \
-        && verify_rocksdb_tree "${fetch_tmp}/rocksdb-${version}" "${version}"; then
-        staged_tree="${fetch_tmp}/rocksdb-${version}"
+    local -a candidate_tags=()
+    if [[ -n "${upstream_tag}" ]]; then
+        candidate_tags=("${upstream_tag}")
     else
-        echo "Tarball fetch failed or mismatched; falling back to git clone v${version}..." >&2
-        rm -rf -- "${fetch_tmp}/rocksdb-clone"
-        git clone --depth 1 --branch "v${version}" "https://github.com/facebook/rocksdb.git" "${fetch_tmp}/rocksdb-clone" >&2
-        rm -rf -- "${fetch_tmp}/rocksdb-clone/.git"
-        if ! verify_rocksdb_tree "${fetch_tmp}/rocksdb-clone" "${version}"; then
-            rm -rf -- "${fetch_tmp}"
-            echo "ERROR: fetched RocksDB v${version} tree failed validation" >&2
-            exit 1
+        candidate_tags=("v${version}")
+        if [[ "${version}" == *.0 ]]; then
+            candidate_tags+=("v${version%.0}")
         fi
-        staged_tree="${fetch_tmp}/rocksdb-clone"
+    fi
+
+    local staged_tree=""
+    for tag in "${candidate_tags[@]}"; do
+        local tarball_url="https://github.com/meta/rocksdb/archive/refs/tags/${tag}.tar.gz"
+        local extracted_dir="${fetch_tmp}/rocksdb-${tag#v}"
+        echo "==> Fetching upstream RocksDB ${tag} (canonical v${version})..." >&2
+        if curl -fsSL --retry 3 --retry-delay 2 "${tarball_url}" -o "${fetch_tmp}/rocksdb.tar.gz" \
+            && tar -xzf "${fetch_tmp}/rocksdb.tar.gz" -C "${fetch_tmp}" \
+            && verify_rocksdb_tree "${extracted_dir}" "${version}"; then
+            staged_tree="${extracted_dir}"
+            break
+        fi
+        rm -rf -- "${fetch_tmp}/rocksdb.tar.gz" "${extracted_dir}"
+    done
+
+    if [[ -z "${staged_tree}" ]]; then
+        for tag in "${candidate_tags[@]}"; do
+            echo "Tarball fetch failed or mismatched; falling back to git clone ${tag}..." >&2
+            rm -rf -- "${fetch_tmp}/rocksdb-clone"
+            if git clone --depth 1 --branch "${tag}" "https://github.com/meta/rocksdb.git" "${fetch_tmp}/rocksdb-clone" >&2; then
+                rm -rf -- "${fetch_tmp}/rocksdb-clone/.git"
+                if verify_rocksdb_tree "${fetch_tmp}/rocksdb-clone" "${version}"; then
+                    staged_tree="${fetch_tmp}/rocksdb-clone"
+                    break
+                fi
+            fi
+            rm -rf -- "${fetch_tmp}/rocksdb-clone"
+        done
+    fi
+
+    if [[ -z "${staged_tree}" ]]; then
+        rm -rf -- "${fetch_tmp}"
+        echo "ERROR: failed to fetch valid RocksDB v${version} tree (tried tags: ${candidate_tags[*]})" >&2
+        exit 1
     fi
 
     rm -rf -- "${src_slot}"
@@ -205,7 +261,11 @@ ensure_rocksdb_source() {
     printf '%s\n' "${src_slot}"
 }
 
-SRC_DIR="$(ensure_rocksdb_source "${VERSION}")"
+SRC_DIR="$(ensure_rocksdb_source "${VERSION}" "${UPSTREAM_TAG}")"
+if [[ "${FETCH_ONLY}" -eq 1 ]]; then
+    printf '%s\n' "${SRC_DIR}"
+    exit 0
+fi
 SRC_DIR_NATIVE="$(to_native_path "${SRC_DIR}")"
 MANIFEST_NATIVE="$(to_native_path "${REPO_DIR}/Cargo.toml")"
 

@@ -1,0 +1,69 @@
+name: Sync Upstream RocksDB Releases
+
+on:
+  schedule:
+    - cron: "17 4 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      floor_version:
+        description: Inclusive minimum RocksDB version to sync (e.g. 11.13.2)
+        type: string
+        required: false
+        default: "11.13.2"
+      max_versions:
+        description: Maximum incomplete upstream versions to build per run
+        type: number
+        required: false
+        default: 3
+      dry_run:
+        description: Discover missing builds without running compilations or publishing releases
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream-rocksdb
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover Missing Upstream Builds
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      has_work: ${{ steps.check.outputs.has_work }}
+      releases_json: ${{ steps.check.outputs.releases_json }}
+      matrix_json: ${{ steps.check.outputs.matrix_json }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLOOR_VERSION: ${{ inputs.floor_version || '11.13.2' }}
+          MAX_VERSIONS: ${{ inputs.max_versions || '3' }}
+        run: |
+          python3 ./scripts/discover_missing_builds.py \
+            --upstream-repo meta/rocksdb \
+            --prebuilt-repo "${GITHUB_REPOSITORY}" \
+            --floor "${FLOOR_VERSION}" \
+            --targets "x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc" \
+            --max-versions "${MAX_VERSIONS}" \
+            --github-output "${GITHUB_OUTPUT}" \
+            --step-summary "${GITHUB_STEP_SUMMARY}"
+
+  build-missing:
+    name: Build & Publish Missing Archives
+    needs: discover
+    if: needs.discover.outputs.has_work == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-prebuilt.yml
+    with:
+      releases_json: ${{ needs.discover.outputs.releases_json }}
+      matrix_json: ${{ needs.discover.outputs.matrix_json }}
+      publish_release: true
